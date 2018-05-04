@@ -10,48 +10,61 @@ class FS20Actor extends Actor {
   
   private var have = State(Map.empty)
   private var want = State(Map.empty)
-  private var plan = Seq.empty[Command]
+  private var plan = Seq.empty[Packet]
   private var zoneForAddress = Map.empty[Address,ActorRef]
+  private val houseCode = HouseCode(self.path.name)
   
   override def receive = {
-    case Have(actuator, brightness) =>
-      have += actuator -> brightness
+    case actuator: Actuator =>
+      have += actuator -> Command.off
       zoneForAddress = have.actuators.keySet.map(a => a.otherAddresses.map(_ -> a.zone) + (a.primaryAddress -> a.zone)).flatten.toMap
-      for (b <- want.get(actuator) if b != brightness) {
-        replan()
-      }
-      
-    case Want(actuator, brightness) =>
-      want += actuator -> brightness
-      for (b <- have.get(actuator) if b !=  brightness) {
-        replan()
-      }
-      
-    case Proceed if !plan.isEmpty =>
-      val command = plan.head
-      zoneForAddress(command.address) ! Zone.SendToProxy(command)
-      plan = plan.tail
-      //sender ! Send(proxies, cmd, 75.milliseconds)
     
+    case Packet(h, address, brightness) if h == houseCode =>
+      var needReplan = false
+      for (actuator <- have.lookup(address)) {
+        have += actuator -> brightness
+        zoneForAddress = have.actuators.keySet.map(a => a.otherAddresses.map(_ -> a.zone) + (a.primaryAddress -> a.zone)).flatten.toMap
+        for (b <- want.get(actuator) if b != brightness) {
+          needReplan = true
+        }        
+      }
+      if (needReplan) {
+        replan()
+      }
+      
+    case Want(address, brightness) =>
+      for (actuator <- have.lookupPrimary(address)) {
+        want += actuator -> brightness
+        for (b <- have.get(actuator) if b != brightness) {
+          replan()
+        }        
+      }
+      
     case Proceed if plan.isEmpty =>
       sender ! Idle
+      
+    case Proceed =>
+      val command = plan.head
+      zoneForAddress(command.address) ! Zone.Transmit(command)
+      plan = plan.tail
+      sender ! (if (plan.isEmpty) Idle else WantToProceed)
   }
   
   def replan() {
-	  plan = want.planFrom(have)
-	  if (plan.isEmpty) {
-	    context.parent ! Idle
-	  } else {
-	    context.parent ! Awaiting
-	  }
+	  plan = want.planFrom(houseCode, have)
+	  sender ! (if (plan.isEmpty) Idle else WantToProceed)
   }
 }
 
 object FS20Actor {
-  private[fs20] case class State(actuators: Map[Actuator, Brightness]) {
-    def + (t: (Actuator, Brightness)) = State(actuators + t)
+  private[fs20] case class State(actuators: Map[Actuator, Command]) {
+    def + (t: (Actuator, Command)) = State(actuators + t)
     
-    def changesFrom (have: State): Map[Brightness, Set[Actuator]] = {
+    def lookup(address: Address): Iterable[Actuator] = actuators.filter { case (a,c) => a.respondsTo(address) }.map(_._1)
+    
+    def lookupPrimary (address: Address): Option[Actuator] = actuators.find { case (a,c) => a.primaryAddress == address }.map(_._1)
+    
+    def changesFrom (have: State): Map[Command, Set[Actuator]] = {
       val diff = for (
         (a, b) <- actuators;
         haveIt = have.get(a)
@@ -62,11 +75,11 @@ object FS20Actor {
     
     def get(a: Actuator) = actuators.get(a)
     
-    def getBrightnesses(address: Address): Set[Brightness] = 
+    def getBrightnesses(address: Address): Set[Command] = 
       actuators.filterKeys(_.respondsTo(address)).values.toSet
       
-    def planFrom (have: State): Seq[Command] = {
-      val plan = Seq.newBuilder[Command]
+    def planFrom (houseCode: HouseCode, have: State): Seq[Packet] = {
+      val plan = Seq.newBuilder[Packet]
       
   	  // find actuators that share brightness and a common code (that's not shared by other actuators)
       for ((brightness, actuators) <- changesFrom(have)) {
@@ -90,7 +103,7 @@ object FS20Actor {
         // sort candidate codes by number of target actuators. Then, pick from that list first, rinse and repeat.
         while (!codes.isEmpty) {
           val (nibble, actuators) = codes.maxBy(_._2.size)
-          plan += Command(nibble, brightness)
+          plan += Packet(houseCode, nibble, brightness)
           remaining --= actuators
           codes -= nibble
           for (a <- actuators) {
@@ -108,7 +121,7 @@ object FS20Actor {
         
         // The remaining actuators have to be applied one by one, since they don't share a code
         for (a <- remaining) {
-          plan += Command(a.primaryAddress, brightness)
+          plan += Packet(houseCode, a.primaryAddress, brightness)
         }
       }
       
@@ -116,14 +129,22 @@ object FS20Actor {
     }
   }
   
-  case class Have(actuator: Actuator, brightness: Brightness)
-  case class Want(actuator: Actuator, brightness: Brightness)
+
   
-  // the following should be pushed down into a generic radio package
-  case object Proceed  // go ahead and send stuff out. reply:
-  case class Send(proxy: String, cmd: Any, duration: FiniteDuration)  // radio is in use this long
+  // requests:
+  /** Sent by an actuator in order to register itself. No reply */
+  case class Actuator(primaryAddress: Address, otherAddresses: Set[Address], zone: ActorRef) {
+    def respondsTo(address: Address) = primaryAddress == address || otherAddresses(address)
+  }
+  // can also send fs20 Packet to this actor, indicating that packet was received. Reply will be given.
+  /** Request to set the given primaryAddress to a value. Reply will be given. */
+  case class Want(primaryAddress: Address, brightness: Command)
+  /** Request to send out the next radio packet, if needed. Reply will be given. */
+  case object Proceed  // go ahead and send stuff out
   
+  // responses:
+  /** No more radio packets need to be sent */
   case object Idle     // don't need to send stuff out
-  
-  case object Awaiting // need to send stuff out
+  /** More radio packets need to be sent, and will be done upon receiving the next Proceed */
+  case object WantToProceed // need to send stuff out
 }
